@@ -9,29 +9,110 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# eda
 
 ```{r}
-library(dplyr)
 library(readr)
 library(purrr)
 
+lol_data <- list.files("data/raw", full.names = TRUE) |>
+  map_dfr(read_csv, guess_max = Inf)
 
-file_ids <- c(
-  "2024" = "1IjIEhLc9n8eLKeY-yh_YigKVWbhgGBsN",
-  "2025" = "1v6LRphp2kYciU4SXp0PCjEMuev1bDejc",
-  "2026" = "1hnpbrUpBMS1TZI7IovfpKeZfWJH1Aptm"
-)
-
-dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
-
-for (year in names(file_ids)) {
-  url <- paste0("https://drive.google.com/uc?export=download&id=", file_ids[[year]])
-  download.file(url, destfile = paste0("data/raw/", year, ".csv"), mode = "wb")
-}
-
-library(readr)
-library(purrr)
-
-lol_data <- list.files("data/raw", full.names = TRUE) |> map_dfr(read_csv)
 dim(lol_data)
 ```
+
+
+```{r}
+names(lol_data)
+
+one_game <- lol_data |> filter(gameid == first(gameid))
+one_game |> select(gameid, side, position, playername, teamname, champion, kills, deaths, assists, result) |> print(n = 12)
+```
+
+```{r}
+# confirm they're truly identical, not just similar
+identical(lol_data$dragons, lol_data$`dragons (type unknown)`)
+
+# find out which specific file(s) actually contain the oddly-named column
+walk(list.files("data/raw", full.names = TRUE), function(f) {
+  cols <- names(read_csv(f, n_max = 0, show_col_types = FALSE))
+  if ("dragons (type unknown)" %in% cols) cat(f, "\n")
+})
+```
+
+```{r}
+# do dragons and the "unknown type" column ever both have values in the same row,
+# or are they mutually exclusive (suggesting one is a fallback for the other)?
+lol_data |>
+  summarise(
+    both_na      = sum(is.na(dragons) & is.na(`dragons (type unknown)`)),
+    dragons_only = sum(!is.na(dragons) & is.na(`dragons (type unknown)`)),
+    unknown_only = sum(is.na(dragons) & !is.na(`dragons (type unknown)`)),
+    both_present = sum(!is.na(dragons) & !is.na(`dragons (type unknown)`))
+  )
+
+# does it line up with data completeness specifically?
+lol_data |>
+  count(datacompleteness, has_unknown_dragons = !is.na(`dragons (type unknown)`))
+```
+
+```{r}
+lol_data <- lol_data |>
+  select(-`dragons (type unknown)`)
+```
+
+```{r}
+lol_data |>
+  group_by(datacompleteness) |>
+  summarise(pct_na_golddiffat15 = mean(is.na(golddiffat15)), n = n())
+```
+
+```{r}
+lol_data |>
+  group_by(datacompleteness) |>
+  summarise(
+    pct_na_result = mean(is.na(result)),
+    pct_na_gamelength = mean(is.na(gamelength)),
+    pct_na_kills = mean(is.na(kills)),
+    pct_na_dragons = mean(is.na(dragons)),
+    n = n()
+  )
+```
+```{r}
+10/12
+```
+
+```{r}
+lol_data |>
+  filter(position == "team") |>
+  group_by(datacompleteness) |>
+  summarise(pct_na_dragons = mean(is.na(dragons)), n = n())
+```
+
+```{r}
+lol_data |>
+  filter(datacompleteness == "complete") |>
+  group_by(position) |>
+  summarise(pct_na_golddiffat15 = mean(is.na(golddiffat15)), n = n())
+```
+
+```{r}
+one_game_teams <- lol_data |>
+  filter(position == "team", gameid == first(gameid)) |>
+  select(gameid, side, result, goldat15, opp_goldat15, golddiffat15)
+
+print(one_game_teams)
+```
+
+```{r}
+complete_gameid <- lol_data |>
+  filter(position == "team", datacompleteness == "complete") |>
+  slice(1) |>
+  pull(gameid)
+
+lol_data |>
+  filter(position == "team", gameid == complete_gameid) |>
+  select(gameid, side, result, goldat15, opp_goldat15, golddiffat15)
+```
+
+
