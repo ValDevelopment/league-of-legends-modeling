@@ -1,0 +1,37 @@
+---
+title: "lol-modeling"
+author: "Vladislav Fedorov"
+date: "2026-07-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(dplyr)
+library(readr)
+library(purrr)
+
+
+file_ids <- c(
+  "2024" = "1IjIEhLc9n8eLKeY-yh_YigKVWbhgGBsN",
+  "2025" = "1v6LRphp2kYciU4SXp0PCjEMuev1bDejc",
+  "2026" = "1hnpbrUpBMS1TZI7IovfpKeZfWJH1Aptm"
+)
+
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+
+for (year in names(file_ids)) {
+  url <- paste0("https://drive.google.com/uc?export=download&id=", file_ids[[year]])
+  download.file(url, destfile = paste0("data/raw/", year, ".csv"), mode = "wb")
+}
+
+library(readr)
+library(purrr)
+
+lol_data <- list.files("data/raw", full.names = TRUE) |> map_dfr(read_csv)
+dim(lol_data)
+```
