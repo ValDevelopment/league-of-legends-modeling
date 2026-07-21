@@ -1,5 +1,5 @@
 ---
-title: "lol-modeling"
+title: "League of Legends Esports Analysis"
 author: "Vladislav Fedorov"
 date: "2026-07-20"
 output: html_document
@@ -9,7 +9,9 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# eda
+# Part 1: Win Prediction
+
+## Data loading and structure
 
 ```{r}
 library(readr)
@@ -17,25 +19,27 @@ library(purrr)
 library(tidyr)
 library(dplyr)
 
+# Oracle's Elixir professional match data, one CSV per year
 lol_data <- list.files("data/raw", full.names = TRUE) |>
   map_dfr(read_csv, guess_max = Inf)
 
 dim(lol_data)
 ```
 
-
 ```{r}
+# each game is 12 rows: 2 team-level rows (position == "team") + 10 player-level rows
 names(lol_data)
 
 one_game <- lol_data |> filter(gameid == first(gameid))
 one_game |> select(gameid, side, position, playername, teamname, champion, kills, deaths, assists, result) |> print(n = 12)
 ```
 
+## Data quality checks
+
 ```{r}
-# confirm they're truly identical, not just similar
+# "dragons (type unknown)" turned out to be a duplicate of "dragons"
 identical(lol_data$dragons, lol_data$`dragons (type unknown)`)
 
-# find out which specific file(s) actually contain the oddly-named column
 walk(list.files("data/raw", full.names = TRUE), function(f) {
   cols <- names(read_csv(f, n_max = 0, show_col_types = FALSE))
   if ("dragons (type unknown)" %in% cols) cat(f, "\n")
@@ -43,8 +47,8 @@ walk(list.files("data/raw", full.names = TRUE), function(f) {
 ```
 
 ```{r}
-# do dragons and the "unknown type" column ever both have values in the same row,
-# or are they mutually exclusive (suggesting one is a fallback for the other)?
+# the duplicate only ever appears alongside a real "dragons" value, and only for
+# partial-completeness games. The column is dropped in the next code chunk
 lol_data |>
   summarise(
     both_na      = sum(is.na(dragons) & is.na(`dragons (type unknown)`)),
@@ -53,7 +57,6 @@ lol_data |>
     both_present = sum(!is.na(dragons) & !is.na(`dragons (type unknown)`))
   )
 
-# does it line up with data completeness specifically?
 lol_data |>
   count(datacompleteness, has_unknown_dragons = !is.na(`dragons (type unknown)`))
 ```
@@ -70,6 +73,8 @@ lol_data |>
 ```
 
 ```{r}
+# final results, per-player stats, and team objective counts are fully present in both
+# completeness groups
 lol_data |>
   group_by(datacompleteness) |>
   summarise(
@@ -80,11 +85,10 @@ lol_data |>
     n = n()
   )
 ```
-```{r}
-10/12
-```
 
 ```{r}
+# the ~83% NA rate above is a row-type issue, not a completeness issue: dragons is
+# a team-level stat and is never populated on the 10 player rows per game
 lol_data |>
   filter(position == "team") |>
   group_by(datacompleteness) |>
@@ -92,6 +96,7 @@ lol_data |>
 ```
 
 ```{r}
+# golddiffat15 lives on team rows too, not just player rows
 lol_data |>
   filter(datacompleteness == "complete") |>
   group_by(position) |>
@@ -99,14 +104,8 @@ lol_data |>
 ```
 
 ```{r}
-one_game_teams <- lol_data |>
-  filter(position == "team", gameid == first(gameid)) |>
-  select(gameid, side, result, goldat15, opp_goldat15, golddiffat15)
-
-print(one_game_teams)
-```
-
-```{r}
+# the two team rows per game are exact mirror images of each other (own/opp stats,
+# diff columns) 
 complete_gameid <- lol_data |>
   filter(position == "team", datacompleteness == "complete") |>
   slice(1) |>
@@ -117,14 +116,13 @@ lol_data |>
   select(gameid, side, result, goldat15, opp_goldat15, golddiffat15)
 ```
 
-# pre modeling features
+## Feature preparation
 
 ```{r}
+# first-objective indicators follow the same mirrored, team-perspective pattern
 lol_data |>
   filter(position == "team", gameid == complete_gameid) |>
   select(gameid, side, result, firstblood, firstdragon, firsttower, firstherald, firstbaron)
-
-
 ```
 
 ```{r}
@@ -134,18 +132,20 @@ win_prediction_data <- lol_data |>
          golddiffat15, xpdiffat15, csdiffat15,
          firstblood, firstdragon, firsttower, firstherald)
 
+# no leftover missingness in the feature set
 win_prediction_data |>
   summarise(across(c(golddiffat15, xpdiffat15, csdiffat15, firstblood, firstdragon, firsttower, firstherald),
                     ~ mean(is.na(.))))
 ```
 
-# modeling
+## Baseline model and year-over-year stability
 
 ```{r}
 library(xgboost)
 ```
 
 ```{r}
+# checked whether the early-game/win relationship held steady year to year
 model_2024 <- glm(result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
                    data = win_prediction_data |> filter(year == 2024) |> na.omit(), family = binomial)
 model_2025 <- glm(result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
@@ -154,9 +154,13 @@ model_2025 <- glm(result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood +
 cbind(coef(model_2024), coef(model_2025))
 ```
 
-Noticeable difference between effect size between 2024/5. However, it is defensible that 2024 and 2025 are still valuable for prediction of results in 2026.
+Gold and XP differentials stayed stable across years, but firsttower/firstherald roughly
+doubled in weight and firstblood's effect nearly vanished by 2025. Pooling 2024-2025 for
+training is still defensible since the dominant predictor (golddiffat15) is the stable one;
+the drift in the secondary indicators is investigated properly in Part 4.
 
 ```{r}
+# chronological split: train on full seasons 2024-2025, test on 2026 
 train_data <- win_prediction_data |> filter(year %in% c(2024, 2025)) |> na.omit()
 test_data  <- win_prediction_data |> filter(year == 2026) |> na.omit()
 
@@ -198,13 +202,13 @@ auc(roc_obj)
 ```
 
 ```{r}
-mean(train_data$result)  
+# class balance check 
+mean(train_data$result)
 ```
 
-# xgboost
+## Gradient boosting comparison
 
 ```{r}
-
 params <- xgb.params(
   objective = "binary:logistic"
 )
@@ -240,36 +244,29 @@ auc(roc_xgb)
 xgb.importance(model = xgb_model)
 ```
 
-Using early-game state (gold, XP, and CS differentials at 15 minutes, plus first-objective indicators) from professional League of Legends match data, a logistic regression model trained on 2024–2025 data achieved an AUC of 0.842 on a held-out 2026 test set. A gradient boosting comparison model achieved a nearly identical AUC of 0.840, indicating the relationship between early-game state and match outcome is close to linear.
+**Summary:** Using early-game state (gold, XP, and CS differentials at 15 minutes, plus
+first-objective indicators) from professional League of Legends match data, a logistic
+regression model trained on 2024-2025 data achieved an AUC of 0.842 on a held-out 2026
+test set. A gradient boosting comparison model achieved a nearly identical AUC of 0.840,
+indicating the relationship between early-game state and match outcome is close to linear.
 
-Coefficient stability was checked across training years to assess sensitivity to patch changes. Gold and experience differentials remained stable predictors, while first-objective indicators shifted in importance between years; first blood specifically lost statistical significance by 2025 and showed no predictive value in either model. Gold differential at 15 minutes was the dominant predictor, accounting for approximately 85 percent of the gradient boosting model's total contribution.
+Coefficient stability was checked across training years to assess sensitivity to patch
+changes. Gold and experience differentials remained stable predictors, while
+first-objective indicators shifted in importance between years; first blood specifically
+lost statistical significance by 2025 and showed no predictive value in either model.
+Gold differential at 15 minutes was the dominant predictor, accounting for approximately
+85 percent of the gradient boosting model's total contribution.
 
-# weekly gold difference at 15 minutes 
+# Part 2: Meta-Trend Forecasting
+
+## Building the weekly series
 
 ```{r}
 library(lubridate)
-
-weekly_series <- lol_data |>
-  filter(position == "team", datacompleteness == "complete", side == "Blue") |>
-  mutate(week = floor_date(date, "week")) |>
-  group_by(week) |>
-  summarise(
-    mean_abs_golddiff15 = mean(abs(golddiffat15), na.rm = TRUE),
-    n_games = n()
-  ) |>
-  arrange(week)
-
-range(weekly_series$week)
-nrow(weekly_series)
-
-summary(weekly_series$n_games)
-weekly_series |> filter(n_games < 10) |> print(n = Inf)
-```
-
-```{r}
 library(tsibble)
 library(zoo)
 
+# weekly mean |gold diff at 15 min| as a proxy for how decisive games are early on.
 weekly_series <- lol_data |>
   filter(position == "team", datacompleteness == "complete", side == "Blue") |>
   mutate(week = yearweek(date)) |>
@@ -284,7 +281,9 @@ range(weekly_series$week)
 nrow(weekly_series)
 summary(weekly_series$n_games)
 ```
+
 ```{r}
+# sparse weeks (n_games < 10) get their mean treated as unreliable
 weekly_ts <- weekly_series |>
   mutate(mean_abs_golddiff15 = if_else(n_games < 10, NA_real_, mean_abs_golddiff15)) |>
   as_tsibble(index = week) |>
@@ -297,7 +296,9 @@ weekly_ts <- weekly_ts |>
 
 sum(is.na(weekly_ts$mean_abs_golddiff15))
 ```
+
 ```{r}
+# the one remaining NA is the current, still-in-progress calendar week
 weekly_ts |> filter(is.na(mean_abs_golddiff15))
 ```
 
@@ -310,6 +311,7 @@ nrow(weekly_ts)
 
 ```{r}
 library(ggplot2)
+
 weekly_ts |>
   ggplot(aes(x = week, y = mean_abs_golddiff15)) +
   geom_line() +
@@ -317,12 +319,15 @@ weekly_ts |>
   labs(title = "Weekly mean |gold diff at 15 min|", x = NULL, y = "Gold difference")
 ```
 
+## Investigating the extreme weeks
+
 ```{r}
 weekly_ts |> as_tibble() |> arrange(desc(mean_abs_golddiff15)) |> slice(1:3)
 weekly_ts |> as_tibble() |> arrange(mean_abs_golddiff15) |> slice(1:3)
 ```
 
 ```{r}
+# lowest week traces to MSI. International events produce closer, less decisive early games than domestic play
 low_week_start <- as.Date(min(weekly_ts$week[weekly_ts$mean_abs_golddiff15 == min(weekly_ts$mean_abs_golddiff15)]))
 
 lol_data |>
@@ -331,17 +336,8 @@ lol_data |>
   count(league, patch, sort = TRUE)
 ```
 
-
 ```{r}
-high_week_start <- as.Date(yearweek("2024 W41"))
-lol_data |>
-  filter(position == "team", datacompleteness == "complete", side == "Blue",
-         date >= high_week_start, date < high_week_start + days(7)) |>
-  count(league, patch, sort = TRUE)
-```
-
-```{r}
-# top cluster, checked together as one connected block
+# the highest weeks form a 3-week cluster (2024 W40-W42) 
 lol_data |>
   filter(position == "team", datacompleteness == "complete", side == "Blue") |>
   mutate(week = yearweek(date)) |>
@@ -350,7 +346,6 @@ lol_data |>
   summarise(mean_abs_golddiff15 = mean(abs(golddiffat15), na.rm = TRUE), n = n(), .groups = "drop") |>
   arrange(week, desc(n))
 
-# bottom cluster, checked separately since they're not consecutive
 lol_data |>
   filter(position == "team", datacompleteness == "complete", side == "Blue") |>
   mutate(week = yearweek(date)) |>
@@ -360,14 +355,15 @@ lol_data |>
   arrange(week, desc(n))
 ```
 
-```{r}
-lol_data |>
-  filter(position == "team", datacompleteness == "complete", side == "Blue") |>
-  count(league, sort = TRUE) |>
-  print(n = 20)
-```
+**Result:** high weeks are driven by smaller/regional leagues (bigger skill gaps -> more
+early blowouts), while low weeks trace to MSI/Worlds (evenly matched elite competition
+-> closer games). This pools every league in the dataset together, which is a genuine
+confound worth documenting: a "meta trend" built from this mix reflects both how the top
+of the competitive scene evolves and which smaller leagues happen to be scheduled that
+week. Kept as-is and documented as a limitation rather than narrowing to major leagues
+only, to avoid over-narrowing the analysis.
 
-# modeling 2
+## Classical forecasting models
 
 ```{r}
 library(fable)
@@ -382,10 +378,15 @@ weekly_ts |>
 weekly_ts |>
   gg_tsdisplay(mean_abs_golddiff15, plot_type = "partial")
 ```
+
+ACF tails off gradually while PACF cuts off sharply after lag 1, signifying AR model signature, not
+MA. KPSS test below checks stationarity.
+
 ```{r}
 weekly_ts |> features(mean_abs_golddiff15, unitroot_kpss)
 ```
-KPSS test did not reject stationarity 
+
+KPSS did not reject stationarity, supporting d = 0.
 
 ```{r}
 fit <- weekly_ts |>
@@ -402,6 +403,10 @@ fit |> select(arima_auto) |> report()
 fit |> select(arima_manual) |> report()
 ```
 
+Auto-selection landed on ARIMA(3,0,1); a manually specified AR(1) had a comparable AICc
+(1836.76 vs. 1834.57), close enough that both looked defensible on in-sample fit alone.
+The rolling-origin backtest below compares it on out-of-sample forecasting accuracy.
+
 ```{r}
 weekly_cv <- weekly_ts |>
   stretch_tsibble(.init = 78, .step = 4)
@@ -417,8 +422,10 @@ cv_forecasts <- weekly_cv |>
 cv_forecasts |> accuracy(weekly_ts)
 ```
 
+AR(1) performed meaningfully worse out-of-sample (RMSE 327 vs. 312 for arima_auto)
+despite its close in-sample AIC. ARIMA(3,0,1) and ETS ended up nearly tied as the two best models.
 
-# xgboost on arima(3, 0, 1) model
+## Machine learning comparison
 
 ```{r}
 weekly_features <- weekly_ts |>
@@ -431,7 +438,7 @@ weekly_features <- weekly_ts |>
     lag4 = lag(mean_abs_golddiff15, 4)
   )
 
-# the first 4 rows will have NA lags by construction, since there's no history to lag from yet
+# first 4 rows have no history to lag from, drop them
 sum(is.na(weekly_features$lag4))
 
 weekly_features <- weekly_features |> filter(!is.na(lag4))
@@ -439,8 +446,7 @@ nrow(weekly_features)
 ```
 
 ```{r}
-library(xgboost)
-
+# matches the same rolling-origin folds (.init = 78, .step = 4) used for ARIMA/ETS
 origins <- seq(78, nrow(weekly_features) - 4, by = 4)
 
 fold_results <- map_dfr(origins, function(origin) {
@@ -467,7 +473,6 @@ fold_results <- map_dfr(origins, function(origin) {
   )
 })
 
-# same error metrics as the classical models, computed the same way
 fold_results |>
   summarise(
     RMSE = sqrt(mean((actual - pred)^2)),
@@ -476,6 +481,7 @@ fold_results |>
 ```
 
 ```{r}
+# checking whether xgboost's RMSE advantage traces to the extreme weeks already identified above
 arima_errors <- cv_forecasts |>
   filter(.model == "arima_auto") |>
   as_tibble() |>
@@ -495,13 +501,33 @@ error_compare <- arima_errors |>
 error_compare |> print(n = 15)
 ```
 
-Weekly mean early-game gold differential (|golddiffat15|) was constructed as a proxy for how decisive professional games are by the 15-minute mark, then forecast using classical and machine learning approaches with rolling-origin backtesting. Extreme weeks were investigated directly to identify their underlying causes. Unusually high weeks were driven by smaller regional leagues, while unusually low weeks corresponded to international events (MSI, Worlds), where closely matched competition produces less decisive early games. This league-composition effect is documented as a known limitation of the pooled series.
+**Summary:** Weekly mean early-game gold differential (|golddiffat15|) was constructed as
+a proxy for how decisive professional games are by the 15-minute mark, then forecast
+using classical and machine learning approaches with rolling-origin backtesting. Extreme
+weeks were investigated directly to identify their underlying causes. Unusually high
+weeks were driven by smaller regional leagues, while unusually low weeks corresponded to
+international events (MSI, Worlds), where closely matched competition produces less
+decisive early games. This league-composition effect is documented as a known limitation
+of the pooled series.
 
-Model order was identified via ACF/PACF inspection and confirmed against automatic ARIMA selection. A manually specified AR(1) model had comparable in-sample AIC to the selected ARIMA(3,0,1) but performed meaningfully worse on out-of-sample backtesting (RMSE 327 vs. 312), illustrating that in-sample fit criteria do not reliably predict forecasting accuracy. ARIMA(3,0,1) and an ETS model performed comparably as the strongest classical approaches.
+Model order was identified via ACF/PACF inspection and confirmed against automatic ARIMA
+selection; a manually specified AR(1) model had comparable in-sample AIC to the selected
+ARIMA(3,0,1) but performed meaningfully worse on out-of-sample backtesting (RMSE 327 vs.
+312), illustrating that in-sample fit criteria do not reliably predict forecasting
+accuracy. ARIMA(3,0,1) and an ETS model performed comparably as the strongest classical
+approaches.
 
-A gradient boosting model using lagged features was subsequently compared against both using matched backtesting folds, achieving a notably lower RMSE (274.7 vs. 311.7), with MAE remaining comparable. This advantage was traced to specific weeks surrounding major international tournaments and season transitions, periods during which the series behaves least like a smooth continuous process, consistent with a nonlinear model more effectively capturing sharp deviations from trend that a linear autoregressive structure underestimates.
+A gradient boosting model using lagged features was subsequently compared against both
+using matched backtesting folds, achieving a notably lower RMSE (274.7 vs. 311.7), with
+MAE remaining comparable. This advantage was traced to specific weeks surrounding major
+international tournaments and season transitions, periods during which the series
+behaves least like a smooth continuous process, consistent with a nonlinear model more
+effectively capturing sharp deviations from trend that a linear autoregressive structure
+underestimates.
 
-# leagues comparison
+# Part 3: Cross-Region Team Rating
+
+## League structure and region mapping
 
 ```{r}
 lol_data |>
@@ -511,6 +537,7 @@ lol_data |>
 ```
 
 ```{r}
+# LCS/LTA N and LLA+CBLOL/LTA S share substantial team rosters
 lcs_teams  <- lol_data |> filter(league == "LCS", position == "team") |> distinct(teamname) |> pull()
 ltan_teams <- lol_data |> filter(league == "LTA N", position == "team") |> distinct(teamname) |> pull()
 intersect(lcs_teams, ltan_teams)
@@ -527,6 +554,7 @@ region_map <- tibble(
              "Latin America", "Latin America", "Latin America")
 )
 
+# a team's home region is whichever major league it appears in most
 team_home_region <- lol_data |>
   filter(position == "team", league %in% region_map$league) |>
   left_join(region_map, by = "league") |>
@@ -540,6 +568,7 @@ nrow(team_home_region)
 ```
 
 ```{r}
+# one row per game, chronologically ordered 
 game_results <- lol_data |>
   filter(position == "team") |>
   select(gameid, date, side, teamname, result) |>
@@ -551,10 +580,11 @@ game_results <- lol_data |>
 nrow(game_results)
 sum(is.na(game_results$date))
 ```
-# elo model
 
+## Elo rating modeling
 
 ```{r}
+# K-factor tested empirically (one-step-ahead Brier score)
 run_elo <- function(K) {
   teams <- unique(c(game_results$team_blue, game_results$team_red))
   ratings <- setNames(rep(1500, length(teams)), teams)
@@ -589,6 +619,7 @@ results_by_K
 ```
 
 ```{r}
+# K=24 vs K=48 (best Brier score): top tier is identical, but mid-table rankings reshuffle  
 run_elo_full <- function(K) {
   teams <- unique(c(game_results$team_blue, game_results$team_red))
   ratings <- setNames(rep(1500, length(teams)), teams)
@@ -620,6 +651,7 @@ compare_ratings |> arrange(desc(rating_48)) |> slice(1:10) |> select(teamname, r
 ```
 
 ```{r}
+# checked whether T1's rank change under higher K traces to a real recent form dip
 game_results |>
   filter(team_blue == "T1" | team_red == "T1") |>
   mutate(t1_won = (team_blue == "T1" & winner == "T1") | (team_red == "T1" & winner == "T1")) |>
@@ -629,7 +661,9 @@ game_results |>
   summarise(win_rate = mean(t1_won), n = n())
 ```
 
-keep K = 24
+K = 24 retained: the conventional value, empirically close to the Brier-optimal K=48, and the top competitive tier is identical under both.
+
+## Regional comparison
 
 ```{r}
 region_ratings <- team_home_region |>
@@ -653,14 +687,13 @@ region_ratings |>
 ```
 
 ```{r}
-# a cleaner proxy for "elite tier strength" than a mean dragged around by weak teams
+# top-3 average as a cleaner proxy for elite-tier strength than a mean that a few weak teams can offset
 region_ratings |>
   group_by(region) |>
   slice_max(rating_24, n = 3) |>
   summarise(top3_mean = mean(rating_24), .groups = "drop") |>
   arrange(desc(top3_mean))
 
-# how much uncertainty actually surrounds each region's mean, given how uneven n_teams is
 set.seed(1)
 bootstrap_region_means <- map_dfr(1:2000, function(i) {
   region_ratings |>
@@ -675,15 +708,36 @@ bootstrap_region_means |>
   arrange(desc(lower_95))
 ```
 
-Team strength was estimated using a sequentially updated Elo rating system spanning all professional matches, including domestic league play and international events (MSI, Worlds), which serve as the primary bridge for comparing teams across regions that otherwise rarely compete against one another. Prior to model construction, a structural change in the Americas competitive scene was identified and confirmed through team-roster overlap: LCS, LLA, and CBLOL were consolidated into a unified LTA system mid-dataset, requiring these leagues to be treated as continuous regions.
+**Summary:** Team strength was estimated using a sequentially updated Elo rating system
+spanning all professional matches, including domestic league play and international
+events (MSI, Worlds), which serve as the primary bridge for comparing teams across
+regions that otherwise rarely compete against one another. Prior to model construction,
+a structural change in the Americas competitive scene was identified and confirmed
+through team-roster overlap: LCS, LLA, and CBLOL were consolidated into a unified LTA
+system mid-dataset, requiring these leagues to be treated as continuous regions.
 
-The K-factor governing rating sensitivity was evaluated empirically across a range of values using one-step-ahead prediction accuracy (Brier score) instead of a default assumption. Results indicated the top competitive tier is stable regardless of K-factor choice, while mid-table rankings show meaningful sensitivity to how heavily recent results are weighted. K=24, the conventional value, was retained given its comparable predictive performance and standard interpretability.
+The K-factor governing rating sensitivity was evaluated empirically across a range of
+values using one-step-ahead prediction accuracy (Brier score) instead of a default
+assumption. Results indicated the top competitive tier is stable regardless of K-factor
+choice, while mid-table rankings show meaningful sensitivity to how heavily recent
+results are weighted. K=24, the conventional value, was retained given its comparable
+predictive performance and standard interpretability.
 
-Regional comparison was conducted using bootstrapped confidence intervals instead of point estimates alone. Raw mean ratings suggested a clear regional hierarchy led by Korea; however, confidence intervals for all five regions overlapped substantially, indicating this apparent ranking is not statistically well-supported given the limited number of teams per region. A top-3 average provided a more defensible measure of elite-tier strength, indicating Korea's advantage over other regions is concentrated in genuine depth at the top. China's high maximum rating, by contrast, reflects a single standout team instead of broad regional strength.
+Regional comparison was conducted using bootstrapped confidence intervals instead of
+point estimates alone. Raw mean ratings suggested a clear regional hierarchy led by
+Korea; however, confidence intervals for all five regions overlapped substantially,
+indicating this apparent ranking is not statistically well-supported given the limited
+number of teams per region. A top-3 average provided a more defensible measure of
+elite-tier strength, indicating Korea's advantage over other regions is concentrated in
+genuine depth at the top. China's high maximum rating, by contrast, reflects a single
+standout team instead of broad regional strength.
 
-# patch hypothesis testing
+# Part 4: Patch-Impact Analysis
+
+## Patch identifier integrity
 
 ```{r}
+# patches use zero-padded notation (e.g. 14.01, 14.10) 
 raw_patches <- map_dfr(list.files("data/raw", full.names = TRUE), function(f) {
   read_csv(f, col_types = cols_only(gameid = col_character(), patch = col_character()))
 })
@@ -692,11 +746,13 @@ raw_patches |> distinct(patch) |> arrange(patch) |> print(n = Inf)
 ```
 
 ```{r}
+# a small number of games (12 of 26,556) have no patch recorded. They are excluded.
 raw_patches |>
   distinct(gameid, .keep_all = TRUE) |>
   summarise(n_missing = sum(is.na(patch)), n_total = n(), pct_missing = mean(is.na(patch)))
 ```
 
+## Locating the shift
 
 ```{r}
 patch_herald_tower <- lol_data |>
@@ -710,19 +766,12 @@ patch_herald_tower <- lol_data |>
   ) |>
   arrange(patch)
 
-# same sparse-sample caution from Part 2 — a handful of games isn't enough to trust a win rate
 summary(patch_herald_tower$n_games)
-patch_herald_tower |> filter(n_games > 30) |> print(n = Inf)
-
-patch_herald_tower |>
-  pivot_longer(cols = c(win_rate_given_herald, win_rate_given_tower), names_to = "objective", values_to = "win_rate") |>
-  ggplot(aes(x = patch, y = win_rate, color = objective, group = objective)) +
-  geom_line() +
-  geom_point() +
-  labs(title = "Win rate given first herald / first tower, by patch", x = "Patch", y = "Win rate")
+patch_herald_tower |> filter(n_games < 30) |> print(n = Inf)
 ```
 
 ```{r}
+# excluding sparse patches (n < 30) and using an ordered factor axis
 patch_herald_tower_clean <- patch_herald_tower |>
   filter(n_games >= 30) |>
   arrange(patch) |>
@@ -736,6 +785,7 @@ patch_herald_tower_clean |>
   labs(title = "Win rate given first herald / first tower, by patch (n \u2265 30 games)", x = "Patch", y = "Win rate") +
   theme(axis.text.x = element_text(angle = 90, hjust = 1))
 ```
+
 
 ```{r}
 win_prediction_patched <- win_prediction_data |>
@@ -752,7 +802,14 @@ season_coefs <- map_dfr(c(14, 15, 16), function(s) {
 season_coefs |> filter(term %in% c("firsttower", "firstherald")) |> arrange(term, season)
 ```
 
+Both objectives roughly double in weight from season 14 to 15, confirming the original
+finding wasn't a calendar-year aspect. Season 16 diverges: firsttower's elevated
+importance persists, while firstherald partially reverts.
+
+## Formal testing
+
 ```{r}
+# likelihood-ratio test for an objective-by-period interaction 
 boundary_data <- win_prediction_patched |>
   filter(season %in% c(14, 15)) |>
   mutate(period = factor(season, levels = c(14, 15), labels = c("before", "after")))
@@ -771,11 +828,30 @@ herald_test <- anova(m_null, m_herald_int, test = "Chisq")
 tower_p  <- tower_test$`Pr(>Chi)`[2]
 herald_p <- herald_test$`Pr(>Chi)`[2]
 
+# FDR correction since both objectives are being tested
 p.adjust(c(firsttower = tower_p, firstherald = herald_p), method = "fdr")
 ```
 
-This analysis investigated an anomaly identified in Part 1: the predictive weight of first herald and first tower on match outcome nearly doubled between two training years, while first blood's effect collapsed to non-significance. Before conducting patch-level analysis, the integrity of the patch identifier was verified directly, confirming that zero-padded patch notation (e.g., 14.01, 14.10) avoids a numeric collision risk that would otherwise be introduced by floating-point storage of version numbers.
+**Summary:** This analysis investigated an anomaly identified in Part 1: the predictive
+weight of first herald and first tower on match outcome nearly doubled between two
+training years, while first blood's effect collapsed to non-significance. Before
+conducting patch-level analysis, the integrity of the patch identifier was verified
+directly, confirming that zero-padded patch notation (e.g., 14.01, 14.10) avoids a
+numeric collision risk that would otherwise be introduced by floating-point storage of
+version numbers.
 
-Season-level coefficients from Part 1's original model were recomputed using patch-derived season boundaries instead of calendar years. Both objectives showed a comparable increase in predictive weight between seasons 14 and 15, confirming the original finding was not an artifact of the calendar-year split. Season 16 revealed a divergence: first tower's elevated importance persisted, while first herald's effect partially reverted toward its original level, indicating two distinct underlying dynamics rather than a single shared cause.
+Season-level coefficients from Part 1's original model were recomputed using
+patch-derived season boundaries instead of calendar years. Both objectives showed a
+comparable increase in predictive weight between seasons 14 and 15, confirming the
+original finding was not an artifact of the calendar-year split. Season 16 revealed a
+divergence: first tower's elevated importance persisted, while first herald's effect
+partially reverted toward its original level, indicating two distinct underlying
+dynamics rather than a single shared cause.
 
-The season 14-to-15 shift was formally tested using likelihood-ratio tests for objective-by-period interaction terms within the original logistic regression, the appropriate test given that the original finding concerned a controlled coefficient rather than a marginal win rate. Following FDR correction across both objectives, both interactions were highly significant (first tower: p = 2.47 × 10⁻¹³; first herald: p = 1.11 × 10⁻⁹), confirming the coefficient shifts identified in Part 1 reflect genuine changes in game dynamics rather than sampling variation.
+The season 14-to-15 shift was formally tested using likelihood-ratio tests for
+objective-by-period interaction terms within the original logistic regression, the
+appropriate test given that the original finding concerned a controlled coefficient
+rather than a marginal win rate. Following FDR correction across both objectives, both
+interactions were highly significant (first tower: p = 2.47 x 10^-13; first herald:
+p = 1.11 x 10^-9), confirming the coefficient shifts identified in Part 1 reflect genuine
+changes in game dynamics rather than sampling variation.
