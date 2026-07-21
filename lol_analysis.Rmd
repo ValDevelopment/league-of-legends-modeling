@@ -2,7 +2,9 @@
 title: "League of Legends Esports Analysis"
 author: "Vladislav Fedorov"
 date: "2026-07-20"
-output: html_document
+output:
+  pdf_document:
+    latex_engine: xelatex
 ---
 
 ```{r setup, include=FALSE}
