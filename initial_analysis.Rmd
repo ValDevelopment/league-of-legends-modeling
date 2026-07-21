@@ -14,6 +14,8 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r}
 library(readr)
 library(purrr)
+library(tidyr)
+library(dplyr)
 
 lol_data <- list.files("data/raw", full.names = TRUE) |>
   map_dfr(read_csv, guess_max = Inf)
@@ -121,6 +123,8 @@ lol_data |>
 lol_data |>
   filter(position == "team", gameid == complete_gameid) |>
   select(gameid, side, result, firstblood, firstdragon, firsttower, firstherald, firstbaron)
+
+
 ```
 
 ```{r}
@@ -136,6 +140,10 @@ win_prediction_data |>
 ```
 
 # modeling
+
+```{r}
+library(xgboost)
+```
 
 ```{r}
 model_2024 <- glm(result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
@@ -155,6 +163,17 @@ test_data  <- win_prediction_data |> filter(year == 2026) |> na.omit()
 nrow(train_data)
 nrow(test_data)
 ```
+
+```{r}
+feature_cols <- c("golddiffat15", "xpdiffat15", "csdiffat15", "firstblood", "firstdragon", "firsttower", "firstherald")
+
+train_matrix <- train_data |> select(all_of(feature_cols)) |> as.matrix()
+test_matrix  <- test_data  |> select(all_of(feature_cols)) |> as.matrix()
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_data$result)
+dtest  <- xgb.DMatrix(data = test_matrix, label = test_data$result)
+```
+
 ```{r}
 model <- glm(
   result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
@@ -163,6 +182,7 @@ model <- glm(
 
 summary(model)
 ```
+
 ```{r}
 library(pROC)
 
@@ -184,7 +204,7 @@ mean(train_data$result)
 # xgboost
 
 ```{r}
-library(xgboost)
+
 params <- xgb.params(
   objective = "binary:logistic"
 )
@@ -246,5 +266,417 @@ summary(weekly_series$n_games)
 weekly_series |> filter(n_games < 10) |> print(n = Inf)
 ```
 
+```{r}
+library(tsibble)
+library(zoo)
+
+weekly_series <- lol_data |>
+  filter(position == "team", datacompleteness == "complete", side == "Blue") |>
+  mutate(week = yearweek(date)) |>
+  group_by(week) |>
+  summarise(
+    mean_abs_golddiff15 = mean(abs(golddiffat15), na.rm = TRUE),
+    n_games = n()
+  ) |>
+  arrange(week)
+
+range(weekly_series$week)
+nrow(weekly_series)
+summary(weekly_series$n_games)
+```
+```{r}
+weekly_ts <- weekly_series |>
+  mutate(mean_abs_golddiff15 = if_else(n_games < 10, NA_real_, mean_abs_golddiff15)) |>
+  as_tsibble(index = week) |>
+  fill_gaps()
+
+sum(is.na(weekly_ts$n_games))
+
+weekly_ts <- weekly_ts |>
+  mutate(mean_abs_golddiff15 = na.approx(mean_abs_golddiff15, na.rm = FALSE))
+
+sum(is.na(weekly_ts$mean_abs_golddiff15))
+```
+```{r}
+weekly_ts |> filter(is.na(mean_abs_golddiff15))
+```
+
+```{r}
+weekly_ts <- weekly_ts |> filter(!is.na(mean_abs_golddiff15))
+
+sum(is.na(weekly_ts$mean_abs_golddiff15))
+nrow(weekly_ts)
+```
+
+```{r}
+library(ggplot2)
+weekly_ts |>
+  ggplot(aes(x = week, y = mean_abs_golddiff15)) +
+  geom_line() +
+  geom_point(data = weekly_ts |> filter(n_games < 10 | is.na(n_games)), color = "red") +
+  labs(title = "Weekly mean |gold diff at 15 min|", x = NULL, y = "Gold difference")
+```
+
+```{r}
+weekly_ts |> as_tibble() |> arrange(desc(mean_abs_golddiff15)) |> slice(1:3)
+weekly_ts |> as_tibble() |> arrange(mean_abs_golddiff15) |> slice(1:3)
+```
+
+```{r}
+low_week_start <- as.Date(min(weekly_ts$week[weekly_ts$mean_abs_golddiff15 == min(weekly_ts$mean_abs_golddiff15)]))
+
+lol_data |>
+  filter(position == "team", datacompleteness == "complete", side == "Blue",
+         date >= low_week_start, date < low_week_start + days(7)) |>
+  count(league, patch, sort = TRUE)
+```
 
 
+```{r}
+high_week_start <- as.Date(yearweek("2024 W41"))
+lol_data |>
+  filter(position == "team", datacompleteness == "complete", side == "Blue",
+         date >= high_week_start, date < high_week_start + days(7)) |>
+  count(league, patch, sort = TRUE)
+```
+
+```{r}
+# top cluster, checked together as one connected block
+lol_data |>
+  filter(position == "team", datacompleteness == "complete", side == "Blue") |>
+  mutate(week = yearweek(date)) |>
+  filter(week %in% yearweek(c("2024 W40", "2024 W41", "2024 W42"))) |>
+  group_by(week, league) |>
+  summarise(mean_abs_golddiff15 = mean(abs(golddiffat15), na.rm = TRUE), n = n(), .groups = "drop") |>
+  arrange(week, desc(n))
+
+# bottom cluster, checked separately since they're not consecutive
+lol_data |>
+  filter(position == "team", datacompleteness == "complete", side == "Blue") |>
+  mutate(week = yearweek(date)) |>
+  filter(week %in% yearweek(c("2025 W27", "2025 W42", "2025 W47"))) |>
+  group_by(week, league) |>
+  summarise(mean_abs_golddiff15 = mean(abs(golddiffat15), na.rm = TRUE), n = n(), .groups = "drop") |>
+  arrange(week, desc(n))
+```
+
+```{r}
+lol_data |>
+  filter(position == "team", datacompleteness == "complete", side == "Blue") |>
+  count(league, sort = TRUE) |>
+  print(n = 20)
+```
+
+# modeling 2
+
+```{r}
+library(fable)
+library(feasts)
+```
+
+```{r}
+weekly_ts |>
+  ACF(mean_abs_golddiff15, lag_max = 20) |>
+  autoplot()
+
+weekly_ts |>
+  gg_tsdisplay(mean_abs_golddiff15, plot_type = "partial")
+```
+```{r}
+weekly_ts |> features(mean_abs_golddiff15, unitroot_kpss)
+```
+KPSS test did not reject stationarity 
+
+```{r}
+fit <- weekly_ts |>
+  model(
+    arima_auto = ARIMA(mean_abs_golddiff15),
+    arima_manual = ARIMA(mean_abs_golddiff15 ~ pdq(1, 0, 0)),
+    ets = ETS(mean_abs_golddiff15)
+  )
+
+fit |> select(arima_auto) |> report()
+```
+
+```{r}
+fit |> select(arima_manual) |> report()
+```
+
+```{r}
+weekly_cv <- weekly_ts |>
+  stretch_tsibble(.init = 78, .step = 4)
+
+cv_forecasts <- weekly_cv |>
+  model(
+    arima_auto   = ARIMA(mean_abs_golddiff15),
+    arima_manual = ARIMA(mean_abs_golddiff15 ~ pdq(1, 0, 0)),
+    ets          = ETS(mean_abs_golddiff15)
+  ) |>
+  forecast(h = 4)
+
+cv_forecasts |> accuracy(weekly_ts)
+```
+
+
+# xgboost on arima(3, 0, 1) model
+
+```{r}
+weekly_features <- weekly_ts |>
+  as_tibble() |>
+  arrange(week) |>
+  mutate(
+    lag1 = lag(mean_abs_golddiff15, 1),
+    lag2 = lag(mean_abs_golddiff15, 2),
+    lag3 = lag(mean_abs_golddiff15, 3),
+    lag4 = lag(mean_abs_golddiff15, 4)
+  )
+
+# the first 4 rows will have NA lags by construction, since there's no history to lag from yet
+sum(is.na(weekly_features$lag4))
+
+weekly_features <- weekly_features |> filter(!is.na(lag4))
+nrow(weekly_features)
+```
+
+```{r}
+library(xgboost)
+
+origins <- seq(78, nrow(weekly_features) - 4, by = 4)
+
+fold_results <- map_dfr(origins, function(origin) {
+  train_fold <- weekly_features |> slice(1:origin)
+  test_fold  <- weekly_features |> slice((origin + 1):(origin + 4))
+
+  dtrain_fold <- xgb.DMatrix(
+    data = as.matrix(train_fold |> select(lag1, lag2, lag3, lag4)),
+    label = train_fold$mean_abs_golddiff15
+  )
+  dtest_fold <- xgb.DMatrix(
+    data = as.matrix(test_fold |> select(lag1, lag2, lag3, lag4))
+  )
+
+  xgb_fold <- xgb.train(
+    params = xgb.params(objective = "reg:squarederror"),
+    data = dtrain_fold, nrounds = 50, verbose = 0
+  )
+
+  tibble(
+    week = test_fold$week,
+    actual = test_fold$mean_abs_golddiff15,
+    pred = predict(xgb_fold, dtest_fold)
+  )
+})
+
+# same error metrics as the classical models, computed the same way
+fold_results |>
+  summarise(
+    RMSE = sqrt(mean((actual - pred)^2)),
+    MAE  = mean(abs(actual - pred))
+  )
+```
+
+```{r}
+arima_errors <- cv_forecasts |>
+  filter(.model == "arima_auto") |>
+  as_tibble() |>
+  left_join(as_tibble(weekly_ts) |> select(week, actual = mean_abs_golddiff15), by = "week") |>
+  mutate(arima_error = abs(actual - .mean)) |>
+  select(week, arima_error)
+
+xgb_errors <- fold_results |>
+  mutate(xgb_error = abs(actual - pred)) |>
+  select(week, xgb_error)
+
+error_compare <- arima_errors |>
+  inner_join(xgb_errors, by = "week") |>
+  mutate(xgb_advantage = arima_error - xgb_error) |>
+  arrange(desc(xgb_advantage))
+
+error_compare |> print(n = 15)
+```
+
+Weekly mean early-game gold differential (|golddiffat15|) was constructed as a proxy for how decisive professional games are by the 15-minute mark, then forecast using classical and machine learning approaches with rolling-origin backtesting. Extreme weeks were investigated directly to identify their underlying causes. Unusually high weeks were driven by smaller regional leagues, while unusually low weeks corresponded to international events (MSI, Worlds), where closely matched competition produces less decisive early games. This league-composition effect is documented as a known limitation of the pooled series.
+
+Model order was identified via ACF/PACF inspection and confirmed against automatic ARIMA selection. A manually specified AR(1) model had comparable in-sample AIC to the selected ARIMA(3,0,1) but performed meaningfully worse on out-of-sample backtesting (RMSE 327 vs. 312), illustrating that in-sample fit criteria do not reliably predict forecasting accuracy. ARIMA(3,0,1) and an ETS model performed comparably as the strongest classical approaches.
+
+A gradient boosting model using lagged features was subsequently compared against both using matched backtesting folds, achieving a notably lower RMSE (274.7 vs. 311.7), with MAE remaining comparable. This advantage was traced to specific weeks surrounding major international tournaments and season transitions, periods during which the series behaves least like a smooth continuous process, consistent with a nonlinear model more effectively capturing sharp deviations from trend that a linear autoregressive structure underestimates.
+
+# leagues comparison
+
+```{r}
+lol_data |>
+  filter(position == "team") |>
+  count(league, sort = TRUE) |>
+  print(n = 30)
+```
+
+```{r}
+lcs_teams  <- lol_data |> filter(league == "LCS", position == "team") |> distinct(teamname) |> pull()
+ltan_teams <- lol_data |> filter(league == "LTA N", position == "team") |> distinct(teamname) |> pull()
+intersect(lcs_teams, ltan_teams)
+
+lla_cblol_teams <- lol_data |> filter(league %in% c("LLA", "CBLOL"), position == "team") |> distinct(teamname) |> pull()
+ltas_teams      <- lol_data |> filter(league == "LTA S", position == "team") |> distinct(teamname) |> pull()
+intersect(lla_cblol_teams, ltas_teams)
+```
+
+```{r}
+region_map <- tibble(
+  league = c("LPL", "LCK", "LEC", "LCS", "LTA N", "LLA", "CBLOL", "LTA S"),
+  region = c("China", "Korea", "Europe", "North America", "North America",
+             "Latin America", "Latin America", "Latin America")
+)
+
+team_home_region <- lol_data |>
+  filter(position == "team", league %in% region_map$league) |>
+  left_join(region_map, by = "league") |>
+  count(teamname, region, sort = TRUE) |>
+  group_by(teamname) |>
+  slice_max(n, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+team_home_region |> count(region, sort = TRUE)
+nrow(team_home_region)
+```
+
+```{r}
+game_results <- lol_data |>
+  filter(position == "team") |>
+  select(gameid, date, side, teamname, result) |>
+  pivot_wider(names_from = side, values_from = c(teamname, result)) |>
+  mutate(winner = if_else(result_Blue == 1, teamname_Blue, teamname_Red)) |>
+  select(gameid, date, team_blue = teamname_Blue, team_red = teamname_Red, winner) |>
+  arrange(date)
+
+nrow(game_results)
+sum(is.na(game_results$date))
+```
+# elo model
+
+
+```{r}
+run_elo <- function(K) {
+  teams <- unique(c(game_results$team_blue, game_results$team_red))
+  ratings <- setNames(rep(1500, length(teams)), teams)
+  n_games <- nrow(game_results)
+  e_blue_vec <- numeric(n_games)
+  actual_blue_win <- numeric(n_games)
+
+  for (i in seq_len(n_games)) {
+    blue <- game_results$team_blue[i]
+    red  <- game_results$team_red[i]
+    r_blue <- ratings[[blue]]
+    r_red  <- ratings[[red]]
+
+    e_blue <- 1 / (1 + 10^((r_red - r_blue) / 400))
+    s_blue <- if (game_results$winner[i] == blue) 1 else 0
+
+    e_blue_vec[i] <- e_blue
+    actual_blue_win[i] <- s_blue
+
+    ratings[[blue]] <- r_blue + K * (s_blue - e_blue)
+    ratings[[red]]  <- r_red + K * ((1 - s_blue) - (1 - e_blue))
+  }
+
+  mean((e_blue_vec - actual_blue_win)^2)
+}
+
+results_by_K <- map_dfr(c(8, 16, 24, 32, 40, 48, 56), function(k) {
+  tibble(K = k, brier_score = run_elo(k))
+})
+
+results_by_K
+```
+
+```{r}
+run_elo_full <- function(K) {
+  teams <- unique(c(game_results$team_blue, game_results$team_red))
+  ratings <- setNames(rep(1500, length(teams)), teams)
+  n_games <- nrow(game_results)
+
+  for (i in seq_len(n_games)) {
+    blue <- game_results$team_blue[i]
+    red  <- game_results$team_red[i]
+    r_blue <- ratings[[blue]]
+    r_red  <- ratings[[red]]
+    e_blue <- 1 / (1 + 10^((r_red - r_blue) / 400))
+    s_blue <- if (game_results$winner[i] == blue) 1 else 0
+    ratings[[blue]] <- r_blue + K * (s_blue - e_blue)
+    ratings[[red]]  <- r_red + K * ((1 - s_blue) - (1 - e_blue))
+  }
+
+  tibble(teamname = names(ratings), rating = unname(ratings))
+}
+
+ratings_24 <- run_elo_full(24) |> rename(rating_24 = rating)
+ratings_48 <- run_elo_full(48) |> rename(rating_48 = rating)
+
+compare_ratings <- ratings_24 |> left_join(ratings_48, by = "teamname")
+
+cor(compare_ratings$rating_24, compare_ratings$rating_48, method = "spearman")
+
+compare_ratings |> arrange(desc(rating_24)) |> slice(1:10) |> select(teamname, rating_24)
+compare_ratings |> arrange(desc(rating_48)) |> slice(1:10) |> select(teamname, rating_48)
+```
+
+```{r}
+game_results |>
+  filter(team_blue == "T1" | team_red == "T1") |>
+  mutate(t1_won = (team_blue == "T1" & winner == "T1") | (team_red == "T1" & winner == "T1")) |>
+  arrange(date) |>
+  mutate(game_num = row_number()) |>
+  group_by(period = ntile(game_num, 4)) |>
+  summarise(win_rate = mean(t1_won), n = n())
+```
+
+keep K = 24
+
+```{r}
+region_ratings <- team_home_region |>
+  left_join(ratings_24, by = "teamname")
+
+region_ratings |>
+  group_by(region) |>
+  summarise(
+    mean_rating = mean(rating_24),
+    median_rating = median(rating_24),
+    max_rating = max(rating_24),
+    n_teams = n()
+  ) |>
+  arrange(desc(mean_rating))
+
+region_ratings |>
+  ggplot(aes(x = reorder(region, rating_24, median), y = rating_24)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  labs(title = "Team Elo ratings by region", x = NULL, y = "Elo rating")
+```
+
+```{r}
+# a cleaner proxy for "elite tier strength" than a mean dragged around by weak teams
+region_ratings |>
+  group_by(region) |>
+  slice_max(rating_24, n = 3) |>
+  summarise(top3_mean = mean(rating_24), .groups = "drop") |>
+  arrange(desc(top3_mean))
+
+# how much uncertainty actually surrounds each region's mean, given how uneven n_teams is
+set.seed(1)
+bootstrap_region_means <- map_dfr(1:2000, function(i) {
+  region_ratings |>
+    group_by(region) |>
+    slice_sample(prop = 1, replace = TRUE) |>
+    summarise(mean_rating = mean(rating_24), .groups = "drop")
+})
+
+bootstrap_region_means |>
+  group_by(region) |>
+  summarise(lower_95 = quantile(mean_rating, 0.025), upper_95 = quantile(mean_rating, 0.975)) |>
+  arrange(desc(lower_95))
+```
+
+Team strength was estimated using a sequentially updated Elo rating system spanning all professional matches, including domestic league play and international events (MSI, Worlds), which serve as the primary bridge for comparing teams across regions that otherwise rarely compete against one another. Prior to model construction, a structural change in the Americas competitive scene was identified and confirmed through team-roster overlap: LCS, LLA, and CBLOL were consolidated into a unified LTA system mid-dataset, requiring these leagues to be treated as continuous regions.
+
+The K-factor governing rating sensitivity was evaluated empirically across a range of values using one-step-ahead prediction accuracy (Brier score) instead of a default assumption. Results indicated the top competitive tier is stable regardless of K-factor choice, while mid-table rankings show meaningful sensitivity to how heavily recent results are weighted. K=24, the conventional value, was retained given its comparable predictive performance and standard interpretability.
+
+Regional comparison was conducted using bootstrapped confidence intervals instead of point estimates alone. Raw mean ratings suggested a clear regional hierarchy led by Korea; however, confidence intervals for all five regions overlapped substantially, indicating this apparent ranking is not statistically well-supported given the limited number of teams per region. A top-3 average provided a more defensible measure of elite-tier strength, indicating Korea's advantage over other regions is concentrated in genuine depth at the top. China's high maximum rating, by contrast, reflects a single standout team instead of broad regional strength.
