@@ -680,3 +680,102 @@ Team strength was estimated using a sequentially updated Elo rating system spann
 The K-factor governing rating sensitivity was evaluated empirically across a range of values using one-step-ahead prediction accuracy (Brier score) instead of a default assumption. Results indicated the top competitive tier is stable regardless of K-factor choice, while mid-table rankings show meaningful sensitivity to how heavily recent results are weighted. K=24, the conventional value, was retained given its comparable predictive performance and standard interpretability.
 
 Regional comparison was conducted using bootstrapped confidence intervals instead of point estimates alone. Raw mean ratings suggested a clear regional hierarchy led by Korea; however, confidence intervals for all five regions overlapped substantially, indicating this apparent ranking is not statistically well-supported given the limited number of teams per region. A top-3 average provided a more defensible measure of elite-tier strength, indicating Korea's advantage over other regions is concentrated in genuine depth at the top. China's high maximum rating, by contrast, reflects a single standout team instead of broad regional strength.
+
+# patch hypothesis testing
+
+```{r}
+raw_patches <- map_dfr(list.files("data/raw", full.names = TRUE), function(f) {
+  read_csv(f, col_types = cols_only(gameid = col_character(), patch = col_character()))
+})
+
+raw_patches |> distinct(patch) |> arrange(patch) |> print(n = Inf)
+```
+
+```{r}
+raw_patches |>
+  distinct(gameid, .keep_all = TRUE) |>
+  summarise(n_missing = sum(is.na(patch)), n_total = n(), pct_missing = mean(is.na(patch)))
+```
+
+
+```{r}
+patch_herald_tower <- lol_data |>
+  filter(position == "team", side == "Blue", !is.na(patch)) |>
+  group_by(patch) |>
+  summarise(
+    win_rate_given_herald = mean(result[firstherald == 1], na.rm = TRUE),
+    win_rate_given_tower  = mean(result[firsttower == 1], na.rm = TRUE),
+    n_games = n(),
+    .groups = "drop"
+  ) |>
+  arrange(patch)
+
+# same sparse-sample caution from Part 2 — a handful of games isn't enough to trust a win rate
+summary(patch_herald_tower$n_games)
+patch_herald_tower |> filter(n_games > 30) |> print(n = Inf)
+
+patch_herald_tower |>
+  pivot_longer(cols = c(win_rate_given_herald, win_rate_given_tower), names_to = "objective", values_to = "win_rate") |>
+  ggplot(aes(x = patch, y = win_rate, color = objective, group = objective)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Win rate given first herald / first tower, by patch", x = "Patch", y = "Win rate")
+```
+
+```{r}
+patch_herald_tower_clean <- patch_herald_tower |>
+  filter(n_games >= 30) |>
+  arrange(patch) |>
+  mutate(patch_factor = factor(patch, levels = unique(patch), ordered = TRUE))
+
+patch_herald_tower_clean |>
+  pivot_longer(cols = c(win_rate_given_herald, win_rate_given_tower), names_to = "objective", values_to = "win_rate") |>
+  ggplot(aes(x = patch_factor, y = win_rate, color = objective, group = objective)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Win rate given first herald / first tower, by patch (n \u2265 30 games)", x = "Patch", y = "Win rate") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+win_prediction_patched <- win_prediction_data |>
+  mutate(season = floor(patch))
+
+season_coefs <- map_dfr(c(14, 15, 16), function(s) {
+  m <- glm(
+    result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
+    data = win_prediction_patched |> filter(season == s), family = binomial
+  )
+  tibble(season = s, term = names(coef(m)), estimate = coef(m))
+})
+
+season_coefs |> filter(term %in% c("firsttower", "firstherald")) |> arrange(term, season)
+```
+
+```{r}
+boundary_data <- win_prediction_patched |>
+  filter(season %in% c(14, 15)) |>
+  mutate(period = factor(season, levels = c(14, 15), labels = c("before", "after")))
+
+m_null <- glm(
+  result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald + period,
+  data = boundary_data, family = binomial
+)
+
+m_tower_int  <- update(m_null, . ~ . + firsttower:period)
+m_herald_int <- update(m_null, . ~ . + firstherald:period)
+
+tower_test  <- anova(m_null, m_tower_int, test = "Chisq")
+herald_test <- anova(m_null, m_herald_int, test = "Chisq")
+
+tower_p  <- tower_test$`Pr(>Chi)`[2]
+herald_p <- herald_test$`Pr(>Chi)`[2]
+
+p.adjust(c(firsttower = tower_p, firstherald = herald_p), method = "fdr")
+```
+
+This analysis investigated an anomaly identified in Part 1: the predictive weight of first herald and first tower on match outcome nearly doubled between two training years, while first blood's effect collapsed to non-significance. Before conducting patch-level analysis, the integrity of the patch identifier was verified directly, confirming that zero-padded patch notation (e.g., 14.01, 14.10) avoids a numeric collision risk that would otherwise be introduced by floating-point storage of version numbers.
+
+Season-level coefficients from Part 1's original model were recomputed using patch-derived season boundaries instead of calendar years. Both objectives showed a comparable increase in predictive weight between seasons 14 and 15, confirming the original finding was not an artifact of the calendar-year split. Season 16 revealed a divergence: first tower's elevated importance persisted, while first herald's effect partially reverted toward its original level, indicating two distinct underlying dynamics rather than a single shared cause.
+
+The season 14-to-15 shift was formally tested using likelihood-ratio tests for objective-by-period interaction terms within the original logistic regression, the appropriate test given that the original finding concerned a controlled coefficient rather than a marginal win rate. Following FDR correction across both objectives, both interactions were highly significant (first tower: p = 2.47 × 10⁻¹³; first herald: p = 1.11 × 10⁻⁹), confirming the coefficient shifts identified in Part 1 reflect genuine changes in game dynamics rather than sampling variation.
