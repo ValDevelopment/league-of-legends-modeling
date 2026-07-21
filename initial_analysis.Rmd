@@ -202,3 +202,49 @@ cv <- xgb.cv(
 best_nrounds <- cv$early_stop$best_iteration
 best_nrounds
 ```
+
+```{r}
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain, nrounds = best_nrounds
+)
+
+test_data <- test_data |>
+  mutate(pred_prob_xgb = predict(xgb_model, dtest))
+
+roc_xgb <- roc(test_data$result, test_data$pred_prob_xgb)
+auc(roc_xgb)
+```
+
+```{r}
+xgb.importance(model = xgb_model)
+```
+
+Using early-game state (gold, XP, and CS differentials at 15 minutes, plus first-objective indicators) from professional League of Legends match data, a logistic regression model trained on 2024–2025 data achieved an AUC of 0.842 on a held-out 2026 test set. A gradient boosting comparison model achieved a nearly identical AUC of 0.840, indicating the relationship between early-game state and match outcome is close to linear.
+
+Coefficient stability was checked across training years to assess sensitivity to patch changes. Gold and experience differentials remained stable predictors, while first-objective indicators shifted in importance between years; first blood specifically lost statistical significance by 2025 and showed no predictive value in either model. Gold differential at 15 minutes was the dominant predictor, accounting for approximately 85 percent of the gradient boosting model's total contribution.
+
+# weekly gold difference at 15 minutes 
+
+```{r}
+library(lubridate)
+
+weekly_series <- lol_data |>
+  filter(position == "team", datacompleteness == "complete", side == "Blue") |>
+  mutate(week = floor_date(date, "week")) |>
+  group_by(week) |>
+  summarise(
+    mean_abs_golddiff15 = mean(abs(golddiffat15), na.rm = TRUE),
+    n_games = n()
+  ) |>
+  arrange(week)
+
+range(weekly_series$week)
+nrow(weekly_series)
+
+summary(weekly_series$n_games)
+weekly_series |> filter(n_games < 10) |> print(n = Inf)
+```
+
+
+
