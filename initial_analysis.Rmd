@@ -115,4 +115,90 @@ lol_data |>
   select(gameid, side, result, goldat15, opp_goldat15, golddiffat15)
 ```
 
+# pre modeling features
 
+```{r}
+lol_data |>
+  filter(position == "team", gameid == complete_gameid) |>
+  select(gameid, side, result, firstblood, firstdragon, firsttower, firstherald, firstbaron)
+```
+
+```{r}
+win_prediction_data <- lol_data |>
+  filter(position == "team", datacompleteness == "complete") |>
+  select(gameid, side, teamname, league, year, patch, result,
+         golddiffat15, xpdiffat15, csdiffat15,
+         firstblood, firstdragon, firsttower, firstherald)
+
+win_prediction_data |>
+  summarise(across(c(golddiffat15, xpdiffat15, csdiffat15, firstblood, firstdragon, firsttower, firstherald),
+                    ~ mean(is.na(.))))
+```
+
+# modeling
+
+```{r}
+model_2024 <- glm(result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
+                   data = win_prediction_data |> filter(year == 2024) |> na.omit(), family = binomial)
+model_2025 <- glm(result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
+                   data = win_prediction_data |> filter(year == 2025) |> na.omit(), family = binomial)
+
+cbind(coef(model_2024), coef(model_2025))
+```
+
+Noticeable difference between effect size between 2024/5. However, it is defensible that 2024 and 2025 are still valuable for prediction of results in 2026.
+
+```{r}
+train_data <- win_prediction_data |> filter(year %in% c(2024, 2025)) |> na.omit()
+test_data  <- win_prediction_data |> filter(year == 2026) |> na.omit()
+
+nrow(train_data)
+nrow(test_data)
+```
+```{r}
+model <- glm(
+  result ~ golddiffat15 + xpdiffat15 + csdiffat15 + firstblood + firstdragon + firsttower + firstherald,
+  data = train_data, family = binomial
+)
+
+summary(model)
+```
+```{r}
+library(pROC)
+
+test_data <- test_data |>
+  mutate(pred_prob = predict(model, newdata = test_data, type = "response"),
+         pred_class = ifelse(pred_prob > 0.5, 1, 0))
+
+accuracy <- mean(test_data$pred_class == test_data$result)
+roc_obj <- roc(test_data$result, test_data$pred_prob)
+
+accuracy
+auc(roc_obj)
+```
+
+```{r}
+mean(train_data$result)  
+```
+
+# xgboost
+
+```{r}
+library(xgboost)
+params <- xgb.params(
+  objective = "binary:logistic"
+)
+
+set.seed(1)
+cv <- xgb.cv(
+  params = params,
+  data = dtrain, nrounds = 500, nfold = 5,
+  metrics = list("auc"),
+  early_stopping_rounds = 20,
+  maximize = TRUE,
+  verbose = 0
+)
+
+best_nrounds <- cv$early_stop$best_iteration
+best_nrounds
+```
